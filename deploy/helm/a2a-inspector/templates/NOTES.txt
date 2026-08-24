@@ -1,0 +1,14 @@
+{{ .Chart.Name }} {{ .Chart.Version }} deployed as {{ include "a2a-inspector.fullname" . }}.
+
+Image: {{ include "a2a-inspector.image" . }}
+
+{{ if .Values.ingress.enabled -}}
+Reachable at http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/
+{{- else -}}
+No ingress configured. Reach it with:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "a2a-inspector.fullname" . }} 8080:{{ .Values.service.port }}
+{{- end }}
+
+Reminder: the inspector is unauthenticated and fetches arbitrary user-supplied
+URLs from inside the cluster. Only expose it on an internal hostname.

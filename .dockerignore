@@ -20,7 +20,12 @@ build/
 .mypy_cache/
 
 # Node / Frontend specific
-node_modules/
+# Must be **/node_modules: a bare `node_modules/` only matches the repo root,
+# so a developer's frontend/node_modules would be copied into the image and
+# shadow the one npm ci installs -- native binaries such as esbuild are then
+# built for the wrong platform and `npm run build` dies with "Exec format
+# error". CI never sees this because a fresh checkout has no node_modules.
+**/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
