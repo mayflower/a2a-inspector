@@ -54,7 +54,7 @@ interface A2APart {
   filename?: string;
   metadata?: Record<string, unknown>;
   // v0.3 FilePart nested structure
-  file?: { bytes?: string; uri?: string; mimeType?: string; name?: string };
+  file?: {bytes?: string; uri?: string; mimeType?: string; name?: string};
   // v0.3 discriminated union field
   type?: string;
   // Catch-all for future fields
@@ -117,6 +117,27 @@ interface DebugLog {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any;
   id: string;
+}
+
+/** An OAuth2 scheme the agent card declares, as parsed by the backend. */
+interface OAuthScheme {
+  schemeName: string;
+  authorizationUrl: string | null;
+  tokenUrl: string;
+  availableScopes: string[];
+  requiredScopes: string[];
+  required: boolean;
+  metadataUrl: string | null;
+  resource: string | null;
+  description: string | null;
+}
+
+interface OAuthStatusEvent {
+  status: 'authorized' | 'error';
+  scheme?: string;
+  expiresAt?: number;
+  expires_at?: number;
+  message?: string;
 }
 
 // Declare hljs global from CDN
@@ -234,6 +255,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let contextId: string | null = null;
   let isConnected = false;
+  // OAuth schemes the connected agent declares. Populated from the
+  // /agent-card response, which is the only place the endpoints are known,
+  // so the login form can be prefilled instead of typed out.
+  let oauthSchemes: Record<string, OAuthScheme> = {};
+  let oauthMessage = '';
+  let oauthMessageIsError = false;
   let supportedInputModes: string[] = ['text/plain'];
   let supportedOutputModes: string[] = ['text/plain'];
   let isResizing = false;
@@ -331,6 +358,241 @@ document.addEventListener('DOMContentLoaded', () => {
     return group;
   };
 
+  // ==========================================================================
+  // OAuth 2.0
+  // ==========================================================================
+
+  const setOAuthMessage = (message: string, isError = false) => {
+    oauthMessage = message;
+    oauthMessageIsError = isError;
+    const el = document.getElementById('oauth-status');
+    if (el) {
+      el.textContent = message;
+      el.className = isError ? 'error-text' : 'success-text';
+    }
+  };
+
+  const selectedOAuthScheme = (): OAuthScheme | null => {
+    const names = Object.keys(oauthSchemes);
+    if (names.length === 0) return null;
+    const select = document.getElementById(
+      'oauth-scheme',
+    ) as HTMLSelectElement | null;
+    const chosen = select?.value || names[0];
+    return oauthSchemes[chosen] ?? oauthSchemes[names[0]];
+  };
+
+  /** Common body for both /oauth/start and /oauth/token-exchange. */
+  const oauthRequestBody = (confirmed: boolean) => {
+    const scheme = selectedOAuthScheme();
+    return {
+      sid: socket.id,
+      scheme: scheme?.schemeName,
+      clientId: getInputValue('oauth-client-id'),
+      clientSecret: getInputValue('oauth-client-secret'),
+      scopes: getInputValue('oauth-scopes'),
+      confirmed,
+    };
+  };
+
+  /**
+   * The backend refuses to contact OAuth endpoints that sit outside the
+   * agent's own origin until we confirm, because the endpoints come from a
+   * card fetched from a user-supplied URL. Show what it found and let the
+   * user decide.
+   */
+  const confirmForeignHosts = (data: {
+    foreign_hosts?: string[];
+    agent_origin?: string;
+    message?: string;
+  }): boolean => {
+    const hosts = (data.foreign_hosts || []).join(', ');
+    return window.confirm(
+      `${data.message}\n\n` +
+        `Agent: ${data.agent_origin}\n` +
+        `OAuth endpoints: ${hosts}\n\n` +
+        'Send your credentials there anyway?',
+    );
+  };
+
+  const postOAuth = async (
+    path: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown> | null> => {
+    for (const confirmed of [false, true]) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...oauthRequestBody(confirmed), ...extra}),
+      });
+      const data = await response.json();
+
+      if (response.status === 409 && data.status === 'confirmation_required') {
+        if (confirmed) return null;
+        if (!confirmForeignHosts(data)) {
+          setOAuthMessage('Login cancelled.', true);
+          return null;
+        }
+        continue;
+      }
+      if (!response.ok) {
+        setOAuthMessage(
+          data.error || `Request failed (${response.status})`,
+          true,
+        );
+        return null;
+      }
+      return data;
+    }
+    return null;
+  };
+
+  const startOAuthLogin = async () => {
+    setOAuthMessage('Opening the identity provider...');
+    const data = await postOAuth('/oauth/start');
+    if (!data) return;
+
+    // A popup, not a redirect: navigating away would reload the page and
+    // take the Socket.IO session -- which the login is bound to -- with it.
+    const popup = window.open(
+      data.authorization_url as string,
+      'a2a-oauth-login',
+      'width=520,height=680',
+    );
+    if (!popup) {
+      setOAuthMessage(
+        'The login window was blocked. Allow popups for this site and try again.',
+        true,
+      );
+      return;
+    }
+    setOAuthMessage('Waiting for you to finish signing in...');
+  };
+
+  const startTokenExchange = async () => {
+    const subjectToken = getInputValue('oauth-subject-token');
+    if (!subjectToken) {
+      setOAuthMessage('A subject token is required to exchange.', true);
+      return;
+    }
+    setOAuthMessage('Exchanging token...');
+    const data = await postOAuth('/oauth/token-exchange', {subjectToken});
+    if (data) {
+      setOAuthMessage('Token acquired. You can send messages now.');
+    }
+  };
+
+  const buildOAuthPanel = (container: HTMLElement) => {
+    const names = Object.keys(oauthSchemes);
+    if (names.length === 0) {
+      const hint = document.createElement('p');
+      hint.className = 'placeholder-text';
+      hint.textContent = isConnected
+        ? 'This agent card declares no OAuth2 security scheme.'
+        : 'Connect to an agent first — its card supplies the OAuth endpoints.';
+      container.appendChild(hint);
+      return;
+    }
+
+    if (names.length > 1) {
+      const group = document.createElement('div');
+      group.className = 'auth-input-group';
+      const label = document.createElement('label');
+      label.htmlFor = 'oauth-scheme';
+      label.textContent = 'Security Scheme';
+      const select = document.createElement('select');
+      select.id = 'oauth-scheme';
+      for (const name of names) {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = name;
+        select.appendChild(option);
+      }
+      select.addEventListener('change', () => renderAuthInputs('oauth2'));
+      group.appendChild(label);
+      group.appendChild(select);
+      container.appendChild(group);
+    }
+
+    const scheme = oauthSchemes[names[0]];
+    const scopes = (
+      scheme.requiredScopes.length
+        ? scheme.requiredScopes
+        : scheme.availableScopes
+    ).join(' ');
+
+    container.appendChild(
+      createAuthInput(
+        'oauth-client-id',
+        'Client ID',
+        'text',
+        'The client ID registered with the provider',
+      ),
+    );
+    container.appendChild(
+      createAuthInput(
+        'oauth-client-secret',
+        'Client Secret (optional)',
+        'password',
+        'Leave empty for a public client (PKCE)',
+      ),
+    );
+    container.appendChild(
+      createAuthInput(
+        'oauth-scopes',
+        'Scopes',
+        'text',
+        'Space separated',
+        scopes,
+      ),
+    );
+
+    const actions = document.createElement('div');
+    actions.className = 'oauth-actions';
+
+    if (scheme.authorizationUrl) {
+      const loginBtn = document.createElement('button');
+      loginBtn.id = 'oauth-login-btn';
+      loginBtn.type = 'button';
+      loginBtn.textContent = 'Log in';
+      loginBtn.addEventListener('click', startOAuthLogin);
+      actions.appendChild(loginBtn);
+    }
+
+    const exchangeBtn = document.createElement('button');
+    exchangeBtn.id = 'oauth-exchange-btn';
+    exchangeBtn.type = 'button';
+    exchangeBtn.textContent = 'Exchange token';
+    exchangeBtn.addEventListener('click', startTokenExchange);
+    actions.appendChild(exchangeBtn);
+    container.appendChild(actions);
+
+    // Token exchange is for providers that trust an upstream issuer rather
+    // than offering an interactive login; it needs a token to trade in.
+    container.appendChild(
+      createAuthInput(
+        'oauth-subject-token',
+        'Subject Token (for exchange only)',
+        'password',
+        'A token from the upstream issuer',
+      ),
+    );
+
+    if (!scheme.authorizationUrl) {
+      const note = document.createElement('p');
+      note.className = 'placeholder-text';
+      note.textContent =
+        'This scheme declares no authorization endpoint, so an interactive login is not possible. Use token exchange.';
+      container.appendChild(note);
+    }
+
+    const status = document.createElement('p');
+    status.id = 'oauth-status';
+    status.className = oauthMessageIsError ? 'error-text' : 'success-text';
+    status.textContent = oauthMessage;
+    container.appendChild(status);
+  };
+
   // Auth type change handler
   const renderAuthInputs = (authType: string) => {
     authInputsContainer.replaceChildren();
@@ -388,6 +650,10 @@ document.addEventListener('DOMContentLoaded', () => {
             'Enter password',
           ),
         );
+        break;
+
+      case 'oauth2':
+        buildOAuthPanel(authInputsContainer);
         break;
 
       case 'none':
@@ -789,6 +1055,13 @@ document.addEventListener('DOMContentLoaded', () => {
         throw new Error(data.error || `HTTP error! status: ${response.status}`);
       }
 
+      // The card is the only source for the OAuth endpoints, so refresh
+      // the login form now that we have it.
+      oauthSchemes = data.oauth_schemes || {};
+      if (authTypeSelect.value === 'oauth2') {
+        renderAuthInputs('oauth2');
+      }
+
       agentCardCodeContent.textContent = JSON.stringify(data.card, null, 2);
       if (window.hljs) {
         window.hljs.highlightElement(agentCardCodeContent);
@@ -822,6 +1095,20 @@ document.addEventListener('DOMContentLoaded', () => {
       validationErrorsContainer.innerHTML = `<p class="error-text">Error: ${(error as Error).message}</p>`;
       chatInput.disabled = true;
       sendBtn.disabled = true;
+    }
+  });
+
+  socket.on('oauth_status', (data: OAuthStatusEvent) => {
+    if (data.status === 'authorized') {
+      const expiresAt = data.expiresAt ?? data.expires_at;
+      const suffix = expiresAt
+        ? ` Token valid until ${new Date(expiresAt * 1000).toLocaleTimeString()}; it is renewed automatically.`
+        : '';
+      setOAuthMessage(
+        `Signed in${data.scheme ? ` (${data.scheme})` : ''}.${suffix}`,
+      );
+    } else {
+      setOAuthMessage(data.message || 'Login failed.', true);
     }
   });
 
@@ -946,7 +1233,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const placeholder = chatMessages.querySelector('.placeholder-text');
       if (placeholder) {
-        placeholder.textContent = '💬 Send a message to start chatting with the agent.';
+        placeholder.textContent =
+          '💬 Send a message to start chatting with the agent.';
       }
     }
   };
@@ -1180,9 +1468,10 @@ document.addEventListener('DOMContentLoaded', () => {
           const content = processPart(p);
           if (content) statusParts.push(content);
         });
-        const statusBody = statusParts.length > 0
-          ? statusParts.join('')
-          : `State: ${DOMPurify.sanitize(statusState)}`;
+        const statusBody =
+          statusParts.length > 0
+            ? statusParts.join('')
+            : `State: ${DOMPurify.sanitize(statusState)}`;
         const messageHtml = `<span class="kind-chip kind-chip-status-update">${event.kind}</span> ${statusBody}`;
         appendMessage(
           'agent progress',

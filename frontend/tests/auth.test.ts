@@ -18,6 +18,7 @@ describe('Authentication UI', () => {
           <option value="basic">Basic Auth</option>
           <option value="bearer">Bearer Token</option>
           <option value="api-key">API Key</option>
+          <option value="oauth2">OAuth 2.0</option>
         </select>
         <div id="auth-inputs" class="auth-inputs"></div>
         <div id="headers-list"></div>
@@ -33,9 +34,9 @@ describe('Authentication UI', () => {
       expect(authTypeSelect.value).toBe('none');
     });
 
-    it('should contain all four auth type options', () => {
+    it('should contain all auth type options', () => {
       const options = Array.from(authTypeSelect.options).map(opt => opt.value);
-      expect(options).toEqual(['none', 'basic', 'bearer', 'api-key']);
+      expect(options).toEqual(['none', 'basic', 'bearer', 'api-key', 'oauth2']);
     });
 
     it('should change value when a different option is selected', () => {
@@ -211,6 +212,7 @@ describe('Custom Header Generation', () => {
           <option value="basic">Basic Auth</option>
           <option value="bearer">Bearer Token</option>
           <option value="api-key">API Key</option>
+          <option value="oauth2">OAuth 2.0</option>
         </select>
         <div id="auth-inputs" class="auth-inputs"></div>
         <div id="headers-list"></div>
@@ -643,3 +645,221 @@ function getCustomHeaders(): Record<string, string> {
 
   return headers;
 }
+
+/**
+ * OAuth2 panel.
+ *
+ * Like the rest of this file, the production logic is mirrored here rather
+ * than imported, because src/script.ts is one big DOMContentLoaded closure
+ * with no exports. buildOAuthPanel is reproduced with its module state
+ * passed in, so the rendering rules stay under test.
+ */
+interface TestOAuthScheme {
+  schemeName: string;
+  authorizationUrl: string | null;
+  tokenUrl: string;
+  availableScopes: string[];
+  requiredScopes: string[];
+  required: boolean;
+}
+
+function buildOAuthPanel(
+  container: HTMLElement,
+  schemes: Record<string, TestOAuthScheme>,
+  isConnected: boolean,
+) {
+  container.replaceChildren();
+  const names = Object.keys(schemes);
+
+  if (names.length === 0) {
+    const hint = document.createElement('p');
+    hint.className = 'placeholder-text';
+    hint.textContent = isConnected
+      ? 'This agent card declares no OAuth2 security scheme.'
+      : 'Connect to an agent first — its card supplies the OAuth endpoints.';
+    container.appendChild(hint);
+    return;
+  }
+
+  if (names.length > 1) {
+    const select = document.createElement('select');
+    select.id = 'oauth-scheme';
+    for (const name of names) {
+      const option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      select.appendChild(option);
+    }
+    container.appendChild(select);
+  }
+
+  const scheme = schemes[names[0]];
+  const scopes = (
+    scheme.requiredScopes.length
+      ? scheme.requiredScopes
+      : scheme.availableScopes
+  ).join(' ');
+
+  container.appendChild(
+    createAuthInput('oauth-client-id', 'Client ID', 'text', ''),
+  );
+  container.appendChild(
+    createAuthInput(
+      'oauth-client-secret',
+      'Client Secret (optional)',
+      'password',
+      '',
+    ),
+  );
+  container.appendChild(
+    createAuthInput('oauth-scopes', 'Scopes', 'text', '', scopes),
+  );
+
+  const actions = document.createElement('div');
+  actions.className = 'oauth-actions';
+  if (scheme.authorizationUrl) {
+    const loginBtn = document.createElement('button');
+    loginBtn.id = 'oauth-login-btn';
+    loginBtn.textContent = 'Log in';
+    actions.appendChild(loginBtn);
+  }
+  const exchangeBtn = document.createElement('button');
+  exchangeBtn.id = 'oauth-exchange-btn';
+  exchangeBtn.textContent = 'Exchange token';
+  actions.appendChild(exchangeBtn);
+  container.appendChild(actions);
+
+  container.appendChild(
+    createAuthInput(
+      'oauth-subject-token',
+      'Subject Token (for exchange only)',
+      'password',
+      '',
+    ),
+  );
+}
+
+describe('OAuth2 Panel', () => {
+  let container: HTMLElement;
+
+  const scheme = (
+    overrides: Partial<TestOAuthScheme> = {},
+  ): TestOAuthScheme => ({
+    schemeName: 'AgentOAuth',
+    authorizationUrl: 'https://agent.example/oauth/authorize',
+    tokenUrl: 'https://agent.example/oauth/token',
+    availableScopes: ['a2a:message:send', 'a2a:task:read'],
+    requiredScopes: ['a2a:message:send'],
+    required: true,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    document.body.innerHTML =
+      '<div id="auth-inputs" class="auth-inputs"></div>';
+    container = document.getElementById('auth-inputs') as HTMLElement;
+  });
+
+  it('tells the user to connect before any card is available', () => {
+    buildOAuthPanel(container, {}, false);
+
+    expect(container.textContent).toContain('Connect to an agent first');
+    expect(container.querySelector('#oauth-client-id')).toBeNull();
+  });
+
+  it('reports when a connected agent declares no OAuth scheme', () => {
+    buildOAuthPanel(container, {}, true);
+
+    expect(container.textContent).toContain('no OAuth2 security scheme');
+  });
+
+  it('renders the credential fields once a scheme is known', () => {
+    buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
+
+    expect(container.querySelector('#oauth-client-id')).not.toBeNull();
+    expect(container.querySelector('#oauth-client-secret')).not.toBeNull();
+    expect(container.querySelector('#oauth-scopes')).not.toBeNull();
+  });
+
+  it('prefills the scopes the card requires', () => {
+    buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
+
+    const scopes = container.querySelector('#oauth-scopes') as HTMLInputElement;
+    expect(scopes.value).toBe('a2a:message:send');
+  });
+
+  it('falls back to the declared scopes when none are required', () => {
+    buildOAuthPanel(
+      container,
+      {AgentOAuth: scheme({requiredScopes: [], required: false})},
+      true,
+    );
+
+    const scopes = container.querySelector('#oauth-scopes') as HTMLInputElement;
+    expect(scopes.value).toBe('a2a:message:send a2a:task:read');
+  });
+
+  it('offers an interactive login when the scheme has an authorization endpoint', () => {
+    buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
+
+    expect(container.querySelector('#oauth-login-btn')).not.toBeNull();
+  });
+
+  it('hides the login button for exchange-only providers', () => {
+    // An authorization server offering only token-exchange has no
+    // authorization endpoint, so there is nothing to log in to.
+    buildOAuthPanel(
+      container,
+      {AgentOAuth: scheme({authorizationUrl: null})},
+      true,
+    );
+
+    expect(container.querySelector('#oauth-login-btn')).toBeNull();
+    expect(container.querySelector('#oauth-exchange-btn')).not.toBeNull();
+  });
+
+  it('leaves the client secret empty so PKCE is the default', () => {
+    buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
+
+    const secret = container.querySelector(
+      '#oauth-client-secret',
+    ) as HTMLInputElement;
+    expect(secret.value).toBe('');
+    expect(secret.type).toBe('password');
+  });
+
+  it('lets the user pick when the card declares several schemes', () => {
+    buildOAuthPanel(
+      container,
+      {
+        AgentOAuth: scheme(),
+        Other: scheme({schemeName: 'Other'}),
+      },
+      true,
+    );
+
+    const select = container.querySelector(
+      '#oauth-scheme',
+    ) as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    expect(Array.from(select.options).map(o => o.value)).toEqual([
+      'AgentOAuth',
+      'Other',
+    ]);
+  });
+
+  it('omits the scheme picker when there is only one', () => {
+    buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
+
+    expect(container.querySelector('#oauth-scheme')).toBeNull();
+  });
+
+  it('keeps secret-bearing fields out of the DOM as plain text', () => {
+    buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
+
+    for (const id of ['#oauth-client-secret', '#oauth-subject-token']) {
+      const input = container.querySelector(id) as HTMLInputElement;
+      expect(input.type).toBe('password');
+    }
+  });
+});
