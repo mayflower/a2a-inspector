@@ -130,6 +130,14 @@ interface OAuthScheme {
   metadataUrl: string | null;
   resource: string | null;
   description: string | null;
+  // Filled in from the authorization server's own metadata, which is
+  // authoritative where it disagrees with the card.
+  discovered?: boolean;
+  grantTypesSupported?: string[];
+  supportsAuthorizationCode?: boolean;
+  supportsTokenExchange?: boolean;
+  supportsDynamicRegistration?: boolean;
+  registrationEndpoint?: string | null;
 }
 
 interface OAuthStatusEvent {
@@ -521,12 +529,18 @@ document.addEventListener('DOMContentLoaded', () => {
         : scheme.availableScopes
     ).join(' ');
 
+    // Where the server implements dynamic registration there is nothing to
+    // fill in: the backend registers on demand and the field stays a manual
+    // override.
+    const autoRegisters = scheme.supportsDynamicRegistration === true;
     container.appendChild(
       createAuthInput(
         'oauth-client-id',
-        'Client ID',
+        autoRegisters ? 'Client ID (optional)' : 'Client ID',
         'text',
-        'The client ID registered with the provider',
+        autoRegisters
+          ? 'Leave empty — this server registers clients automatically'
+          : 'The client ID registered with the provider',
       ),
     );
     container.appendChild(
@@ -550,7 +564,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const actions = document.createElement('div');
     actions.className = 'oauth-actions';
 
-    if (scheme.authorizationUrl) {
+    const canLogIn =
+      scheme.supportsAuthorizationCode ?? !!scheme.authorizationUrl;
+    const canExchange = scheme.supportsTokenExchange ?? true;
+
+    if (canLogIn) {
       const loginBtn = document.createElement('button');
       loginBtn.id = 'oauth-login-btn';
       loginBtn.type = 'button';
@@ -559,30 +577,35 @@ document.addEventListener('DOMContentLoaded', () => {
       actions.appendChild(loginBtn);
     }
 
-    const exchangeBtn = document.createElement('button');
-    exchangeBtn.id = 'oauth-exchange-btn';
-    exchangeBtn.type = 'button';
-    exchangeBtn.textContent = 'Exchange token';
-    exchangeBtn.addEventListener('click', startTokenExchange);
-    actions.appendChild(exchangeBtn);
+    if (canExchange) {
+      const exchangeBtn = document.createElement('button');
+      exchangeBtn.id = 'oauth-exchange-btn';
+      exchangeBtn.type = 'button';
+      exchangeBtn.textContent = 'Exchange token';
+      exchangeBtn.addEventListener('click', startTokenExchange);
+      actions.appendChild(exchangeBtn);
+    }
     container.appendChild(actions);
 
     // Token exchange is for providers that trust an upstream issuer rather
     // than offering an interactive login; it needs a token to trade in.
-    container.appendChild(
-      createAuthInput(
-        'oauth-subject-token',
-        'Subject Token (for exchange only)',
-        'password',
-        'A token from the upstream issuer',
-      ),
-    );
+    if (canExchange) {
+      container.appendChild(
+        createAuthInput(
+          'oauth-subject-token',
+          'Subject Token (for exchange only)',
+          'password',
+          'A token from the upstream issuer',
+        ),
+      );
+    }
 
-    if (!scheme.authorizationUrl) {
+    if (!canLogIn) {
       const note = document.createElement('p');
       note.className = 'placeholder-text';
-      note.textContent =
-        'This scheme declares no authorization endpoint, so an interactive login is not possible. Use token exchange.';
+      note.textContent = scheme.discovered
+        ? `This authorization server does not offer an interactive login (it supports: ${(scheme.grantTypesSupported || []).join(', ')}). Use token exchange.`
+        : 'This scheme declares no authorization endpoint, so an interactive login is not possible. Use token exchange.';
       container.appendChild(note);
     }
 

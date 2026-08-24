@@ -67,20 +67,24 @@ Secret.
 
 ## OAuth 2.0
 
-If you point the inspector at agents whose cards declare an OAuth2 security
-scheme, set `OAUTH_REDIRECT_BASE_URL` so the redirect URI it hands the
-identity provider matches the public hostname rather than the in-cluster one:
+Nothing has to be configured. The OAuth redirect URI needs the public
+hostname, which cannot be derived from the request behind an ingress, so the
+chart sets `OAUTH_REDIRECT_BASE_URL` from `ingress.host` for you. Override it
+only if the inspector is reached under a name other than its ingress:
 
 ```yaml
-env:
-  - name: OAUTH_REDIRECT_BASE_URL
-    value: https://a2a-inspector.data.mayflower.zone
+oauth:
+  redirectBaseUrl: https://inspector.example.internal
 ```
 
-Register `https://<that host>/oauth/callback` with the identity provider.
-Without the variable the app falls back to `X-Forwarded-Proto` and
-`X-Forwarded-Host`, which is right for plain deployments but worth pinning
-explicitly behind an ingress.
+With no ingress the variable is omitted and the app falls back to
+`X-Forwarded-Proto` and `X-Forwarded-Host`.
 
-The inspector authenticates as a public client using PKCE by default, so no
-client secret has to be stored anywhere.
+The one thing that cannot be automated is the identity provider's side: the
+redirect URI has to be allowed there. Register `https://<host>/oauth/callback`
+— unless the provider supports dynamic client registration (RFC 7591), in
+which case the inspector registers itself on first login and there is nothing
+to do at all.
+
+The inspector authenticates as a public client using PKCE, so no client
+secret has to be stored anywhere.

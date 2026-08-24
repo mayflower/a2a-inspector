@@ -61,6 +61,12 @@ PENDING_TTL_SECONDS = 600.0
 # Default when the token response omits expires_in.
 DEFAULT_EXPIRES_IN_SECONDS = 300.0
 
+# Discovery documents change rarely, but this is a debugging tool and people
+# do edit their own authorization servers while it is open, so the cache is
+# short rather than permanent.
+METADATA_TTL_SECONDS = 300.0
+
+_HTTP_OK = 200
 _HTTP_BAD_REQUEST = 400
 
 
@@ -511,6 +517,211 @@ async def refresh_tokens(
     if not renewed.refresh_token:
         renewed.refresh_token = token_set.refresh_token
     return renewed
+
+
+# ==============================================================================
+# Authorization server discovery (RFC 8414) and client registration (RFC 7591)
+# ==============================================================================
+
+
+def well_known_urls(scheme: dict[str, Any]) -> list[str]:
+    """Candidate metadata URLs for a security scheme, best first.
+
+    The card may name one outright. Otherwise RFC 8414 says to insert
+    ``/.well-known/oauth-authorization-server`` after the issuer's host,
+    but plenty of servers put it after the issuer's path instead, so both
+    are tried before giving up.
+    """
+    candidates: list[str] = []
+    declared = scheme.get('metadataUrl')
+    if declared:
+        candidates.append(str(declared))
+
+    base = scheme.get('authorizationUrl') or scheme.get('tokenUrl')
+    if base:
+        parsed = urlparse(str(base))
+        origin = origin_of(str(base))
+        # Strip the last path segment: .../oauth/token -> /oauth
+        issuer_path = parsed.path.rsplit('/', 1)[0].rstrip('/')
+        for suffix in (
+            # RFC 8414 to the letter: the well-known segment goes between
+            # host and issuer path.
+            f'{origin}/.well-known/oauth-authorization-server{issuer_path}',
+            # Common deviation: appended to the issuer path instead.
+            f'{origin}{issuer_path}/.well-known/oauth-authorization-server',
+            # Also common: served at the host root even though the issuer
+            # carries a path. Observed on a real deployment.
+            f'{origin}/.well-known/oauth-authorization-server',
+            f'{origin}/.well-known/openid-configuration',
+        ):
+            if suffix not in candidates:
+                candidates.append(suffix)
+
+    return candidates
+
+
+_metadata_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_registration_cache: dict[tuple[str, str], tuple[str, str | None]] = {}
+
+
+def clear_discovery_caches() -> None:
+    """Drop cached metadata and registrations (used by tests)."""
+    _metadata_cache.clear()
+    _registration_cache.clear()
+
+
+async def fetch_metadata(
+    scheme: dict[str, Any], http: httpx.AsyncClient
+) -> dict[str, Any]:
+    """Fetch an authorization server's metadata document.
+
+    Best effort by design: discovery only ever adds information, so any
+    failure returns an empty dict and the card's own declarations stand.
+    """
+    candidates = well_known_urls(scheme)
+    cache_key = candidates[0] if candidates else ''
+    cached = _metadata_cache.get(cache_key)
+    if cached and time.time() - cached[0] < METADATA_TTL_SECONDS:
+        return cached[1]
+
+    for url in candidates:
+        try:
+            response = await http.get(url, timeout=10.0)
+        except httpx.RequestError:
+            continue
+        if response.status_code != _HTTP_OK:
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get('issuer'):
+            logger.info('Discovered authorization server metadata at %s', url)
+            _metadata_cache[cache_key] = (time.time(), payload)
+            return payload
+
+    _metadata_cache[cache_key] = (time.time(), {})
+    return {}
+
+
+async def describe_scheme(
+    scheme: dict[str, Any], http: httpx.AsyncClient
+) -> dict[str, Any]:
+    """Enrich a card-derived scheme with what the server actually supports.
+
+    Agent cards are written by hand and drift: one observed card advertises
+    an authorization_code flow against a server whose metadata lists only
+    token-exchange. Where the two disagree the server wins, so the UI can
+    offer the grants that will actually work instead of the ones that were
+    promised.
+    """
+    metadata = await fetch_metadata(scheme, http)
+    enriched = dict(scheme)
+    enriched['discovered'] = bool(metadata)
+
+    if metadata:
+        # The server's own endpoints supersede the card's.
+        if metadata.get('authorization_endpoint'):
+            enriched['authorizationUrl'] = metadata['authorization_endpoint']
+        if metadata.get('token_endpoint'):
+            enriched['tokenUrl'] = metadata['token_endpoint']
+        if metadata.get('scopes_supported'):
+            enriched['availableScopes'] = list(metadata['scopes_supported'])
+        enriched['registrationEndpoint'] = metadata.get('registration_endpoint')
+        enriched['issuer'] = metadata.get('issuer')
+
+    grants = metadata.get('grant_types_supported')
+    if grants:
+        enriched['grantTypesSupported'] = list(grants)
+        enriched['supportsAuthorizationCode'] = (
+            GRANT_AUTHORIZATION_CODE in grants
+            and bool(enriched.get('authorizationUrl'))
+        )
+        enriched['supportsTokenExchange'] = GRANT_TOKEN_EXCHANGE in grants
+    else:
+        # Without metadata, fall back to what the card implies.
+        enriched['grantTypesSupported'] = []
+        enriched['supportsAuthorizationCode'] = bool(
+            enriched.get('authorizationUrl')
+        )
+        enriched['supportsTokenExchange'] = True
+
+    enriched.setdefault('registrationEndpoint', None)
+    enriched['supportsDynamicRegistration'] = bool(
+        enriched.get('registrationEndpoint')
+    )
+    return enriched
+
+
+async def register_client(
+    registration_endpoint: str,
+    redirect_uri: str,
+    scopes: tuple[str, ...],
+    http: httpx.AsyncClient,
+    client_name: str = 'A2A Inspector',
+) -> tuple[str, str | None]:
+    """Register this inspector as a client, so nobody has to do it by hand.
+
+    RFC 7591. Servers that support this hand back a client_id on the spot,
+    which removes the one piece of setup a user would otherwise have to
+    arrange out of band.
+
+    Returns:
+        The issued client id and secret; the secret is None for a public
+        client, which is what we ask for.
+
+    Raises:
+        OAuthError: If registration is rejected or malformed.
+    """
+    cache_key = (registration_endpoint, redirect_uri)
+    cached = _registration_cache.get(cache_key)
+    if cached:
+        return cached
+
+    body: dict[str, Any] = {
+        'client_name': client_name,
+        'redirect_uris': [redirect_uri],
+        'grant_types': [GRANT_AUTHORIZATION_CODE, GRANT_REFRESH_TOKEN],
+        'response_types': ['code'],
+        # Public client: PKCE carries the security, no secret to store.
+        'token_endpoint_auth_method': 'none',
+        'application_type': 'web',
+    }
+    if scopes:
+        body['scope'] = ' '.join(scopes)
+
+    try:
+        response = await http.post(
+            registration_endpoint, json=body, timeout=15.0
+        )
+    except httpx.RequestError as e:
+        raise OAuthError(
+            f'Could not reach the registration endpoint '
+            f'{registration_endpoint}: {e}'
+        ) from e
+
+    if response.status_code >= _HTTP_BAD_REQUEST:
+        raise OAuthError(_describe_token_error(response))
+
+    try:
+        payload = response.json()
+    except ValueError as e:
+        raise OAuthError(
+            'Registration endpoint returned a body that is not JSON.'
+        ) from e
+
+    client_id = payload.get('client_id')
+    if not client_id:
+        raise OAuthError('Registration succeeded but returned no client_id.')
+
+    logger.info(
+        'Registered dynamically at %s as client %s',
+        registration_endpoint,
+        client_id,
+    )
+    issued = (str(client_id), payload.get('client_secret'))
+    _registration_cache[cache_key] = issued
+    return issued
 
 
 # ==============================================================================

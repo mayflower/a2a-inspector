@@ -3,6 +3,7 @@ import html
 import logging
 import os
 
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
@@ -532,9 +533,10 @@ async def get_agent_card(request: Request) -> JSONResponse:
         response_data = {
             'card': card_data,
             'validation_errors': validation_errors,
-            # Endpoints and scopes for any OAuth2 scheme the card declares,
-            # so the login form can be prefilled instead of typed out.
-            'oauth_schemes': oauth.extract_oauth_schemes(card_data),
+            # Endpoints, scopes and the grants the authorization server
+            # really supports, so the login form can be prefilled and can
+            # offer only what will work.
+            'oauth_schemes': await _describe_oauth_schemes(card_data),
         }
         response_status = 200
 
@@ -564,6 +566,29 @@ async def get_agent_card(request: Request) -> JSONResponse:
 # ==============================================================================
 
 
+async def _describe_oauth_schemes(
+    card_data: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Parse the card's OAuth schemes and ask each server what it supports.
+
+    Discovery uses a clean HTTP client rather than the caller's: the
+    metadata URL comes from the card, which came from a user-supplied URL,
+    and the caller's client carries the user's own auth headers. Those have
+    no business being sent to a host the card nominated.
+    """
+    schemes = oauth.extract_oauth_schemes(card_data)
+    if not schemes:
+        return {}
+
+    async with httpx.AsyncClient(timeout=15.0) as discovery_client:
+        described = {}
+        for name, scheme in schemes.items():
+            described[name] = await oauth.describe_scheme(
+                scheme, discovery_client
+            )
+    return described
+
+
 def _redirect_uri(request: Request) -> str:
     """Where the identity provider should send the user back to.
 
@@ -583,16 +608,19 @@ def _redirect_uri(request: Request) -> str:
     return f'{scheme}://{host}/oauth/callback'
 
 
-def _oauth_config_for(
+async def _oauth_config_for(
     sid: str, payload: dict[str, Any]
-) -> tuple[oauth.OAuthConfig, str]:
+) -> tuple[oauth.OAuthConfig, str, dict[str, Any]]:
     """Build an OAuthConfig from the session's agent card plus user input.
 
-    Endpoints come from the card so they cannot be typed wrong; identity and
-    scopes come from the request.
+    Endpoints come from the card and, where the server publishes metadata,
+    from the server itself, so they cannot be typed wrong. The client
+    identity is the only thing the user might supply -- and not even that
+    where the server supports dynamic registration.
 
     Returns:
-        The config and the agent URL it belongs to, for the origin check.
+        The config, the agent URL it belongs to (for the origin check), and
+        the discovered scheme descriptor.
 
     Raises:
         oauth.OAuthError: If the session or the named scheme is unknown.
@@ -605,7 +633,7 @@ def _oauth_config_for(
 
     _, _, card, _ = clients[sid]
     card_data = _get_agent_card_dict(card)
-    schemes = oauth.extract_oauth_schemes(card_data)
+    schemes = await _describe_oauth_schemes(card_data)
 
     scheme_name = payload.get('scheme') or next(iter(schemes), None)
     if not scheme_name or scheme_name not in schemes:
@@ -614,9 +642,6 @@ def _oauth_config_for(
         )
 
     scheme = schemes[scheme_name]
-    client_id = (payload.get('clientId') or '').strip()
-    if not client_id:
-        raise oauth.OAuthError('A client ID is required.')
 
     requested = payload.get('scopes')
     if isinstance(requested, str):
@@ -626,21 +651,60 @@ def _oauth_config_for(
     else:
         scopes = tuple(scheme['requiredScopes'])
 
+    client_id = (payload.get('clientId') or '').strip()
+    client_secret = (payload.get('clientSecret') or '').strip() or None
+
     config = oauth.OAuthConfig(
         scheme_name=scheme_name,
         token_url=scheme['tokenUrl'],
         client_id=client_id,
         authorization_url=scheme['authorizationUrl'],
-        client_secret=(payload.get('clientSecret') or '').strip() or None,
+        client_secret=client_secret,
         scopes=scopes,
         resource=scheme['resource'],
     )
     agent_url = scheme['resource'] or card_data.get('url') or ''
-    return config, agent_url
+    return config, agent_url, scheme
+
+
+async def _ensure_client_credentials(
+    config: oauth.OAuthConfig,
+    scheme: dict[str, Any],
+    redirect_uri: str,
+) -> oauth.OAuthConfig:
+    """Obtain a client identity when the user did not supply one.
+
+    Servers that implement RFC 7591 will issue one on request, which spares
+    the user registering a client out of band just to look at an agent.
+    Runs after the origin check, because registration contacts the server.
+
+    Raises:
+        oauth.OAuthError: If no client id was given and none can be issued.
+    """
+    if config.client_id:
+        return config
+
+    registration_endpoint = scheme.get('registrationEndpoint')
+    if not registration_endpoint:
+        raise oauth.OAuthError(
+            'A client ID is required: this authorization server does not '
+            'support dynamic client registration, so a client has to be '
+            'registered with it up front.'
+        )
+
+    async with httpx.AsyncClient(timeout=15.0) as registrar:
+        client_id, client_secret = await oauth.register_client(
+            registration_endpoint, redirect_uri, config.scopes, registrar
+        )
+
+    return replace(config, client_id=client_id, client_secret=client_secret)
 
 
 def _foreign_host_response(
-    config: oauth.OAuthConfig, agent_url: str, payload: dict[str, Any]
+    config: oauth.OAuthConfig,
+    agent_url: str,
+    payload: dict[str, Any],
+    scheme: dict[str, Any] | None = None,
 ) -> JSONResponse | None:
     """Ask for confirmation before sending credentials off the agent's origin.
 
@@ -653,6 +717,17 @@ def _foreign_host_response(
         return None
 
     foreign = oauth.foreign_endpoints(config, agent_url)
+
+    # Dynamic registration talks to a host the card nominated as well, so it
+    # belongs behind the same gate.
+    registration_endpoint = (scheme or {}).get('registrationEndpoint')
+    if registration_endpoint and not config.client_id:
+        host = oauth.origin_of(registration_endpoint)
+        if not oauth.is_same_origin(registration_endpoint, agent_url) and (
+            host not in foreign
+        ):
+            foreign.append(host)
+
     if not foreign:
         return None
 
@@ -687,14 +762,16 @@ async def oauth_start(request: Request) -> JSONResponse:
             content={'error': 'A session id is required.'}, status_code=400
         )
 
+    redirect_uri = _redirect_uri(request)
     try:
-        config, agent_url = _oauth_config_for(sid, payload)
-        blocked = _foreign_host_response(config, agent_url, payload)
+        config, agent_url, scheme = await _oauth_config_for(sid, payload)
+        blocked = _foreign_host_response(config, agent_url, payload, scheme)
         if blocked is not None:
             return blocked
 
+        config = await _ensure_client_credentials(config, scheme, redirect_uri)
         url, state = oauth_service.begin_authorization(
-            sid, config, _redirect_uri(request)
+            sid, config, redirect_uri
         )
     except oauth.OAuthError as e:
         return JSONResponse(content={'error': str(e)}, status_code=400)
@@ -739,11 +816,14 @@ async def oauth_token_exchange(request: Request) -> JSONResponse:
         )
 
     try:
-        config, agent_url = _oauth_config_for(sid, payload)
-        blocked = _foreign_host_response(config, agent_url, payload)
+        config, agent_url, scheme = await _oauth_config_for(sid, payload)
+        blocked = _foreign_host_response(config, agent_url, payload, scheme)
         if blocked is not None:
             return blocked
 
+        config = await _ensure_client_credentials(
+            config, scheme, _redirect_uri(request)
+        )
         await _emit_debug_log(
             sid,
             'oauth-token-exchange',

@@ -661,6 +661,11 @@ interface TestOAuthScheme {
   availableScopes: string[];
   requiredScopes: string[];
   required: boolean;
+  discovered?: boolean;
+  grantTypesSupported?: string[];
+  supportsAuthorizationCode?: boolean;
+  supportsTokenExchange?: boolean;
+  supportsDynamicRegistration?: boolean;
 }
 
 function buildOAuthPanel(
@@ -700,8 +705,14 @@ function buildOAuthPanel(
       : scheme.availableScopes
   ).join(' ');
 
+  const autoRegisters = scheme.supportsDynamicRegistration === true;
   container.appendChild(
-    createAuthInput('oauth-client-id', 'Client ID', 'text', ''),
+    createAuthInput(
+      'oauth-client-id',
+      autoRegisters ? 'Client ID (optional)' : 'Client ID',
+      'text',
+      '',
+    ),
   );
   container.appendChild(
     createAuthInput(
@@ -717,26 +728,44 @@ function buildOAuthPanel(
 
   const actions = document.createElement('div');
   actions.className = 'oauth-actions';
-  if (scheme.authorizationUrl) {
+
+  const canLogIn =
+    scheme.supportsAuthorizationCode ?? !!scheme.authorizationUrl;
+  const canExchange = scheme.supportsTokenExchange ?? true;
+
+  if (canLogIn) {
     const loginBtn = document.createElement('button');
     loginBtn.id = 'oauth-login-btn';
     loginBtn.textContent = 'Log in';
     actions.appendChild(loginBtn);
   }
-  const exchangeBtn = document.createElement('button');
-  exchangeBtn.id = 'oauth-exchange-btn';
-  exchangeBtn.textContent = 'Exchange token';
-  actions.appendChild(exchangeBtn);
+  if (canExchange) {
+    const exchangeBtn = document.createElement('button');
+    exchangeBtn.id = 'oauth-exchange-btn';
+    exchangeBtn.textContent = 'Exchange token';
+    actions.appendChild(exchangeBtn);
+  }
   container.appendChild(actions);
 
-  container.appendChild(
-    createAuthInput(
-      'oauth-subject-token',
-      'Subject Token (for exchange only)',
-      'password',
-      '',
-    ),
-  );
+  if (canExchange) {
+    container.appendChild(
+      createAuthInput(
+        'oauth-subject-token',
+        'Subject Token (for exchange only)',
+        'password',
+        '',
+      ),
+    );
+  }
+
+  if (!canLogIn) {
+    const note = document.createElement('p');
+    note.className = 'placeholder-text';
+    note.textContent = scheme.discovered
+      ? `This authorization server does not offer an interactive login (it supports: ${(scheme.grantTypesSupported || []).join(', ')}). Use token exchange.`
+      : 'This scheme declares no authorization endpoint, so an interactive login is not possible. Use token exchange.';
+    container.appendChild(note);
+  }
 }
 
 describe('OAuth2 Panel', () => {
@@ -803,6 +832,61 @@ describe('OAuth2 Panel', () => {
     buildOAuthPanel(container, {AgentOAuth: scheme()}, true);
 
     expect(container.querySelector('#oauth-login-btn')).not.toBeNull();
+  });
+
+  it('hides the login button when the server does not support the grant', () => {
+    // The card may advertise an authorization_code flow that the server
+    // does not actually implement; discovery is authoritative.
+    buildOAuthPanel(
+      container,
+      {
+        AgentOAuth: scheme({
+          discovered: true,
+          grantTypesSupported: [
+            'urn:ietf:params:oauth:grant-type:token-exchange',
+          ],
+          supportsAuthorizationCode: false,
+          supportsTokenExchange: true,
+        }),
+      },
+      true,
+    );
+
+    expect(container.querySelector('#oauth-login-btn')).toBeNull();
+    expect(container.textContent).toContain(
+      'does not offer an interactive login',
+    );
+  });
+
+  it('hides the exchange button when the server does not support it', () => {
+    buildOAuthPanel(
+      container,
+      {
+        AgentOAuth: scheme({
+          discovered: true,
+          supportsAuthorizationCode: true,
+          supportsTokenExchange: false,
+        }),
+      },
+      true,
+    );
+
+    expect(container.querySelector('#oauth-exchange-btn')).toBeNull();
+    expect(container.querySelector('#oauth-subject-token')).toBeNull();
+    expect(container.querySelector('#oauth-login-btn')).not.toBeNull();
+  });
+
+  it('marks the client ID optional where the server registers clients', () => {
+    buildOAuthPanel(
+      container,
+      {AgentOAuth: scheme({supportsDynamicRegistration: true})},
+      true,
+    );
+
+    const label = container.querySelector(
+      'label[for="oauth-client-id"]',
+    ) as HTMLLabelElement;
+    expect(label.textContent).toBe('Client ID (optional)');
   });
 
   it('hides the login button for exchange-only providers', () => {

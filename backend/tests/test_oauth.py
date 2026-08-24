@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import json
 import time
 
 from urllib.parse import parse_qs, urlparse
@@ -671,3 +672,255 @@ class TestOAuthCredentialService:
         assert await service.get_credentials('AgentOAuth', _context()) == (
             'exchanged'
         )
+
+
+# ==============================================================================
+# Discovery and dynamic registration
+# ==============================================================================
+
+
+METADATA_URL = 'https://agent.example/.well-known/oauth-authorization-server'
+REGISTRATION_URL = 'https://agent.example/oauth/register'
+
+
+@pytest.fixture(autouse=True)
+def _clear_caches():
+    """Discovery results are cached; keep tests independent of each other."""
+    oauth.clear_discovery_caches()
+    yield
+    oauth.clear_discovery_caches()
+
+
+def _scheme_dict(**overrides):
+    base = {
+        'schemeName': 'AgentOAuth',
+        'authorizationUrl': AUTHORIZE_URL,
+        'tokenUrl': TOKEN_URL,
+        'availableScopes': ['a2a:message:send'],
+        'requiredScopes': ['a2a:message:send'],
+        'required': True,
+        'metadataUrl': METADATA_URL,
+        'resource': AGENT_URL,
+        'description': None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _metadata(**overrides):
+    payload = {
+        'issuer': 'https://agent.example/oauth',
+        'authorization_endpoint': AUTHORIZE_URL,
+        'token_endpoint': TOKEN_URL,
+        'grant_types_supported': ['authorization_code', 'refresh_token'],
+        'scopes_supported': ['a2a:message:send', 'a2a:task:read'],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestWellKnownUrls:
+    def test_declared_metadata_url_comes_first(self):
+        urls = oauth.well_known_urls(_scheme_dict())
+
+        assert urls[0] == METADATA_URL
+
+    def test_rfc8414_paths_are_derived_when_none_declared(self):
+        urls = oauth.well_known_urls(_scheme_dict(metadataUrl=None))
+
+        assert (
+            'https://agent.example/.well-known/oauth-authorization-server/oauth'
+            in urls
+        )
+        assert (
+            'https://agent.example/oauth/.well-known/oauth-authorization-server'
+            in urls
+        )
+
+    def test_path_less_well_known_is_tried(self):
+        """Servers serve metadata at the host root despite a path issuer."""
+        urls = oauth.well_known_urls(_scheme_dict(metadataUrl=None))
+
+        assert (
+            'https://agent.example/.well-known/oauth-authorization-server'
+            in urls
+        )
+
+
+@pytest.mark.asyncio
+class TestDescribeScheme:
+    async def test_server_metadata_overrides_the_card(self):
+        """A card that disagrees with its own server must not win.
+
+        Observed in the wild: a card advertising an authorization_code flow
+        against a server whose metadata offers only token-exchange.
+        """
+        async with respx.mock:
+            respx.get(METADATA_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json=_metadata(
+                        grant_types_supported=[oauth.GRANT_TOKEN_EXCHANGE]
+                    ),
+                )
+            )
+            async with httpx.AsyncClient() as http:
+                described = await oauth.describe_scheme(_scheme_dict(), http)
+
+        assert described['discovered'] is True
+        assert described['supportsAuthorizationCode'] is False
+        assert described['supportsTokenExchange'] is True
+
+    async def test_endpoints_are_taken_from_metadata(self):
+        async with respx.mock:
+            respx.get(METADATA_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json=_metadata(
+                        token_endpoint='https://agent.example/oauth/v2/token'
+                    ),
+                )
+            )
+            async with httpx.AsyncClient() as http:
+                described = await oauth.describe_scheme(_scheme_dict(), http)
+
+        assert described['tokenUrl'] == 'https://agent.example/oauth/v2/token'
+
+    async def test_registration_support_is_reported(self):
+        async with respx.mock:
+            respx.get(METADATA_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json=_metadata(registration_endpoint=REGISTRATION_URL),
+                )
+            )
+            async with httpx.AsyncClient() as http:
+                described = await oauth.describe_scheme(_scheme_dict(), http)
+
+        assert described['supportsDynamicRegistration'] is True
+        assert described['registrationEndpoint'] == REGISTRATION_URL
+
+    async def test_unreachable_metadata_falls_back_to_the_card(self):
+        """Discovery only ever adds information; failure must not break it."""
+        async with respx.mock:
+            respx.get(url__startswith='https://agent.example').mock(
+                side_effect=httpx.ConnectError('refused')
+            )
+            async with httpx.AsyncClient() as http:
+                described = await oauth.describe_scheme(_scheme_dict(), http)
+
+        assert described['discovered'] is False
+        assert described['tokenUrl'] == TOKEN_URL
+        assert described['supportsAuthorizationCode'] is True
+        assert described['supportsDynamicRegistration'] is False
+
+    async def test_metadata_without_an_issuer_is_ignored(self):
+        """A 200 that is not a metadata document must not be trusted."""
+        async with respx.mock:
+            respx.get(url__startswith='https://agent.example').mock(
+                return_value=httpx.Response(200, json={'hello': 'world'})
+            )
+            async with httpx.AsyncClient() as http:
+                described = await oauth.describe_scheme(_scheme_dict(), http)
+
+        assert described['discovered'] is False
+
+    async def test_metadata_is_cached(self):
+        async with respx.mock:
+            route = respx.get(METADATA_URL).mock(
+                return_value=httpx.Response(200, json=_metadata())
+            )
+            async with httpx.AsyncClient() as http:
+                await oauth.describe_scheme(_scheme_dict(), http)
+                await oauth.describe_scheme(_scheme_dict(), http)
+
+        assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+class TestRegisterClient:
+    async def test_registers_as_a_public_client(self):
+        """PKCE carries the security, so we ask for no secret."""
+        async with respx.mock:
+            route = respx.post(REGISTRATION_URL).mock(
+                return_value=httpx.Response(
+                    201, json={'client_id': 'issued-id'}
+                )
+            )
+            async with httpx.AsyncClient() as http:
+                client_id, secret = await oauth.register_client(
+                    REGISTRATION_URL,
+                    REDIRECT_URI,
+                    ('a2a:message:send',),
+                    http,
+                )
+
+        body = json.loads(route.calls.last.request.content)
+        assert client_id == 'issued-id'
+        assert secret is None
+        assert body['redirect_uris'] == [REDIRECT_URI]
+        assert body['token_endpoint_auth_method'] == 'none'
+        assert body['scope'] == 'a2a:message:send'
+
+    async def test_confidential_registration_is_honoured(self):
+        """Some servers issue a secret regardless; keep it if they do."""
+        async with respx.mock:
+            respx.post(REGISTRATION_URL).mock(
+                return_value=httpx.Response(
+                    201,
+                    json={'client_id': 'id', 'client_secret': 'issued-secret'},
+                )
+            )
+            async with httpx.AsyncClient() as http:
+                _, secret = await oauth.register_client(
+                    REGISTRATION_URL, REDIRECT_URI, (), http
+                )
+
+        assert secret == 'issued-secret'
+
+    async def test_registration_is_cached(self):
+        """Clicking log in twice must not create a second client."""
+        async with respx.mock:
+            route = respx.post(REGISTRATION_URL).mock(
+                return_value=httpx.Response(201, json={'client_id': 'once'})
+            )
+            async with httpx.AsyncClient() as http:
+                first = await oauth.register_client(
+                    REGISTRATION_URL, REDIRECT_URI, (), http
+                )
+                second = await oauth.register_client(
+                    REGISTRATION_URL, REDIRECT_URI, (), http
+                )
+
+        assert first == second
+        assert route.call_count == 1
+
+    async def test_rejected_registration_surfaces(self):
+        async with respx.mock:
+            respx.post(REGISTRATION_URL).mock(
+                return_value=httpx.Response(
+                    400,
+                    json={
+                        'error': 'invalid_redirect_uri',
+                        'error_description': 'not permitted',
+                    },
+                )
+            )
+            async with httpx.AsyncClient() as http:
+                with pytest.raises(oauth.OAuthError) as excinfo:
+                    await oauth.register_client(
+                        REGISTRATION_URL, REDIRECT_URI, (), http
+                    )
+
+        assert 'invalid_redirect_uri' in str(excinfo.value)
+
+    async def test_response_without_client_id(self):
+        async with respx.mock:
+            respx.post(REGISTRATION_URL).mock(
+                return_value=httpx.Response(201, json={'client_name': 'x'})
+            )
+            async with httpx.AsyncClient() as http:
+                with pytest.raises(oauth.OAuthError, match='no client_id'):
+                    await oauth.register_client(
+                        REGISTRATION_URL, REDIRECT_URI, (), http
+                    )

@@ -53,6 +53,12 @@ spec:
             # mount and the home directory cannot drift apart.
             - name: HOME
               value: /tmp
+            {{- with (include "a2a-inspector.publicBaseUrl" .) }}
+            # Derived from ingress.host so the OAuth redirect URI matches the
+            # public hostname without it being configured a second time.
+            - name: OAUTH_REDIRECT_BASE_URL
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
