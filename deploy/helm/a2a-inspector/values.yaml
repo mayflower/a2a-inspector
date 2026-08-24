@@ -17,14 +17,8 @@ image:
 global:
   imagePullPolicy: IfNotPresent
 
-# Empty by default so the chart works against a public registry, but note
-# that GHCR packages are private unless explicitly published: the mayflower
-# package is private today, so the data-muc deployment sets this to
-# [{name: github-registry}] via a Helm parameter on its ArgoCD Application.
-# That secret is cloned into the namespace by the
-# clone-github-registry-a2a-inspector rule in the Kyverno ClusterPolicy at
-# data-muc/platform-apps/self-service-secrets/templates/
-# kyverno-propagate-registry.yaml in the argocd repository.
+# ghcr.io/mayflower/a2a-inspector is public, so no pull secret is needed.
+# Set this if you host the image somewhere that requires authentication.
 imagePullSecrets: []
 
 nameOverride: ""
