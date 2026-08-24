@@ -61,6 +61,30 @@ would briefly run two pods.
 | `securityContext.readOnlyRootFilesystem` | `true` | Works because the chart mounts an `emptyDir` at `/tmp` and the image sets `HOME=/tmp`. |
 | `startupProbe.failureThreshold` | `30` | Importing `a2a-sdk[all]` pulls grpc and protobuf; startup takes a few seconds. |
 
-The app reads no configuration of its own — no environment variables, no
-database, no volumes. Credentials for target agents are entered in the browser
-and forwarded per request, so this chart creates no Secret.
+The app has no database and no volumes. Credentials for target agents are
+entered in the browser and forwarded per request, so this chart creates no
+Secret.
+
+## OAuth 2.0
+
+Nothing has to be configured. The OAuth redirect URI needs the public
+hostname, which cannot be derived from the request behind an ingress, so the
+chart sets `OAUTH_REDIRECT_BASE_URL` from `ingress.host` for you. Override it
+only if the inspector is reached under a name other than its ingress:
+
+```yaml
+oauth:
+  redirectBaseUrl: https://inspector.example.internal
+```
+
+With no ingress the variable is omitted and the app falls back to
+`X-Forwarded-Proto` and `X-Forwarded-Host`.
+
+The one thing that cannot be automated is the identity provider's side: the
+redirect URI has to be allowed there. Register `https://<host>/oauth/callback`
+— unless the provider supports dynamic client registration (RFC 7591), in
+which case the inspector registers itself on first login and there is nothing
+to do at all.
+
+The inspector authenticates as a public client using PKCE, so no client
+secret has to be stored anywhere.

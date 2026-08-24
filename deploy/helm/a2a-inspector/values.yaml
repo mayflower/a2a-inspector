@@ -98,6 +98,13 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 6
 
+oauth:
+  # The OAuth redirect URI has to carry the public hostname, which cannot be
+  # derived from the request behind an ingress. Left empty it is built from
+  # ingress.host, so there is normally nothing to set here -- override only
+  # when the inspector is reached under a different name than its ingress.
+  redirectBaseUrl: ""
+
 env: []
 extraEnv: []
 

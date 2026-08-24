@@ -334,7 +334,7 @@ body.dark-mode input:checked + .slider {
 
 .http-headers-content.expanded,
 .message-metadata-content.expanded {
-    max-height: 800px;
+    max-height: 1200px;
     padding: 10px 0;
     overflow-y: auto;
 }
@@ -483,13 +483,24 @@ body.dark-mode .auth-type-select:hover {
 }
 
 #add-header-btn,
-#add-metadata-btn {
+#add-metadata-btn,
+.oauth-actions button {
     background-color: #1877f2;
     color: white;
     border: none;
     border-radius: 4px;
     padding: 8px 12px;
     cursor: pointer;
+}
+
+.oauth-actions {
+    display: flex;
+    gap: 10px;
+    margin: 12px 0;
+}
+
+#oauth-status:empty {
+    display: none;
 }
 
 #agent-card-url,

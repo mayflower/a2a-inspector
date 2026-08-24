@@ -39,3 +39,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "a2a-inspector.pullPolicy" -}}
 {{- .Values.image.pullPolicy | default .Values.global.imagePullPolicy | default "IfNotPresent" -}}
 {{- end -}}
+
+{{/*
+Public base URL, derived from the ingress this chart already configures.
+Used as the OAuth redirect base so the hostname does not have to be
+maintained in two places. Empty when no ingress is enabled, in which case
+the app falls back to the forwarding headers.
+*/}}
+{{- define "a2a-inspector.publicBaseUrl" -}}
+{{- if .Values.oauth.redirectBaseUrl -}}
+{{- .Values.oauth.redirectBaseUrl | trimSuffix "/" -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled -}}
+{{- printf "%s://%s" $scheme .Values.ingress.host -}}
+{{- end -}}
+{{- end -}}
