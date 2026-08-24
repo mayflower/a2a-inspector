@@ -1,0 +1,114 @@
+# Single replica is load-bearing, not a placeholder. backend/app.py keeps a
+# per-Socket.IO-sid dict of live httpx clients in process memory, and the
+# POST /agent-card handler emits its debug log back to that sid -- so the HTTP
+# request has to reach the same pod that holds the socket. A second replica
+# silently breaks the debug console. Raising this needs a Socket.IO Redis
+# manager in the application first.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/mayflower/a2a-inspector
+  # Defaults to .Chart.AppVersion. The ArgoCD Application pins a sha- tag
+  # published by .github/workflows/docker-publish.yml.
+  tag: ""
+  # Defaults to global.imagePullPolicy.
+  pullPolicy: ""
+
+global:
+  imagePullPolicy: IfNotPresent
+
+# Empty by default so the chart works against a public registry, but note
+# that GHCR packages are private unless explicitly published: the mayflower
+# package is private today, so the data-muc deployment sets this to
+# [{name: github-registry}] via a Helm parameter on its ArgoCD Application.
+# That secret is cloned into the namespace by the
+# clone-github-registry-a2a-inspector rule in the Kyverno ClusterPolicy at
+# data-muc/platform-apps/self-service-secrets/templates/
+# kyverno-propagate-registry.yaml in the argocd repository.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: traefik
+  host: a2a-inspector.data.mayflower.zone
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-intern-dns
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+  tls:
+    enabled: true
+    secretName: a2a-inspector-tls
+
+# Idle RSS measured at ~70Mi with every import resolved (app.py imports the
+# a2a client, and therefore grpc and protobuf, at module scope), so the
+# headroom here is for concurrent streaming sessions rather than for startup.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# GET / is a dependency-free Jinja2 render of the index template and the only
+# sensible probe target; the app ships no health endpoint. Do not probe
+# /agent-card -- it is a POST that reaches out to external hosts.
+startupProbe:
+  httpGet:
+    path: /
+    port: http
+  periodSeconds: 2
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+env: []
+extraEnv: []
+
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
