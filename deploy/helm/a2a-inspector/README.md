@@ -55,7 +55,7 @@ would briefly run two pods.
 | Key | Default | Notes |
 | --- | --- | --- |
 | `image.tag` | `""` | Falls back to `.Chart.AppVersion`. Pin a `sha-` tag in production. |
-| `imagePullSecrets` | `[]` | GHCR packages are private unless published; the data-muc deployment sets `github-registry` here. |
+| `imagePullSecrets` | `[]` | The GHCR package is public; set this only for a registry that needs authentication. |
 | `service.port` / `service.targetPort` | `80` / `8080` | The container listens on 8080. |
 | `ingress.host` | `a2a-inspector.data.mayflower.zone` | |
 | `securityContext.readOnlyRootFilesystem` | `true` | Works because the chart mounts an `emptyDir` at `/tmp` and the image sets `HOME=/tmp`. |
