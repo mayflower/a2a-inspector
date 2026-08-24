@@ -61,6 +61,26 @@ would briefly run two pods.
 | `securityContext.readOnlyRootFilesystem` | `true` | Works because the chart mounts an `emptyDir` at `/tmp` and the image sets `HOME=/tmp`. |
 | `startupProbe.failureThreshold` | `30` | Importing `a2a-sdk[all]` pulls grpc and protobuf; startup takes a few seconds. |
 
-The app reads no configuration of its own — no environment variables, no
-database, no volumes. Credentials for target agents are entered in the browser
-and forwarded per request, so this chart creates no Secret.
+The app has no database and no volumes. Credentials for target agents are
+entered in the browser and forwarded per request, so this chart creates no
+Secret.
+
+## OAuth 2.0
+
+If you point the inspector at agents whose cards declare an OAuth2 security
+scheme, set `OAUTH_REDIRECT_BASE_URL` so the redirect URI it hands the
+identity provider matches the public hostname rather than the in-cluster one:
+
+```yaml
+env:
+  - name: OAUTH_REDIRECT_BASE_URL
+    value: https://a2a-inspector.data.mayflower.zone
+```
+
+Register `https://<that host>/oauth/callback` with the identity provider.
+Without the variable the app falls back to `X-Forwarded-Proto` and
+`X-Forwarded-Host`, which is right for plain deployments but worth pinning
+explicitly behind an ingress.
+
+The inspector authenticates as a public client using PKCE by default, so no
+client secret has to be stored anywhere.

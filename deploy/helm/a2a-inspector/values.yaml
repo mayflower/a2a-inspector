@@ -98,6 +98,10 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 6
 
+# Set OAUTH_REDIRECT_BASE_URL when using OAuth against protected agents, so
+# the redirect URI matches the public hostname instead of the in-cluster one:
+#   - name: OAUTH_REDIRECT_BASE_URL
+#     value: https://a2a-inspector.data.mayflower.zone
 env: []
 extraEnv: []
 
